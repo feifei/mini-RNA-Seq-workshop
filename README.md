@@ -6,12 +6,11 @@ Show two exmples on how to analyze RNA-Seq data, from raw reads to RNA-Seq diffe
 
 This project has the simplest setup an RNA-Seq project have. It contains 2 conditions, 1 control and three replicates for each.
 
-Working directory tree:
+Work directory tree:
 
 ```
 ─── Giardia
     ├── Rcodes
-    │   ├── Rcodes.Rproj
     │   ├── report.Rmd
     │   └── report.html
     ├── data
