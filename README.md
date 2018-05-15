@@ -9,7 +9,7 @@ This project has the simplest setup an RNA-Seq project have. It contains 2 condi
 Working directory tree:
 
 ```
--── Giardia
+─── Giardia
     ├── Rcodes
     │   ├── Rcodes.Rproj
     │   ├── report.Rmd
@@ -36,7 +36,8 @@ This project is a more complicated setup. It's a time-serie RNA-Seq experiment t
 
 Work directory tree:
 
--── Eimeria
+```
+─── Eimeria
     ├── Rcodes
     │   ├── edgeR.eimeria.Rmd
     │   └── edgeR.gallus.Rmd
@@ -49,6 +50,7 @@ Work directory tree:
         ├── count_table.sh
         ├── htseq_count.sh
         └── star_merged.sh
+```
 
 - `scripts` contains the bash scripts for preparing the raw counts for RNA-Seq analysis in R.
 	- `star_merged.sh` maps RNA-Seq fastq files against the combined reference genomes of the host and the parasite using `STAR`.
