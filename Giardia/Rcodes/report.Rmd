@@ -1,0 +1,384 @@
+---
+title: "edgeR for DE analysis of Jingyis project"
+author: "Feifei Xu"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+    number_sections: true
+    df_print: paged
+    code_folding: hide
+    fig_width: 6
+    fig_height: 6
+---
+
+```{r, include=FALSE}
+library(knitr)
+opts_knit$set(progress = FALSE, verbose = FALSE)
+opts_chunk$set(warning=FALSE, message=FALSE, echo=FALSE)
+```
+```{r}
+library(gtools)
+library(limma)
+library(edgeR)
+library(pheatmap)
+library(biomaRt)
+library(ggplot2)
+library(colorspace)
+library(RColorBrewer)
+library(matrixStats)
+library(DT)
+library(reshape2)
+```
+
+# Background
+This report provides the analysis of RNA-Seq data from iron-depletion experiments in Giardia WB. 2 conditions, 1 control and three replicates for each. Analysis was done with edgeR.
+
+
+# Data preparation
+Giardia WB reference genome and annotation were from GiardiaDB (v. 5.0). Annotation in GFF file was converted to GTF to mapping with STAR v. 020201, htseq-count was used to extract the raw counts from the mapped .BAM files.
+
+## Specify some pararmeters, directory and files
+```{r}
+topX <- 2000 # to display in the final heatmap
+thr <- 5 # Set max/min logFC change in the heatmap
+bwColors <- colorRampPalette(c("white", "darkblue")) #?
+
+directory <- "/Volumes/Molev/data/Others/Jingyi/"
+annotation_tab <- paste(directory, "data/wb.tab", sep="") # annotation
+directory <- paste(directory, "edgeR/", sep="")
+meta_file <- paste(directory, "metadata.csv", sep="")
+```
+
+## Data summary
+TYDK is the control, NOFERRIC is TYDK without ferric (less iron), 50uM is TYDK without ferric and supplemented with 50 µM iron inhibitor (even less iron).
+```{r}
+d <- read.csv2(meta_file)
+
+sampleFiles <- paste(d$Identifier, ".counts", sep="")
+d$sampleFiles <- sampleFiles
+conditions <- c("IronInh", "NoFerric", "Control")
+
+group <- factor(rep(conditions, each=3))
+  
+d <- cbind(d,Group=group)
+# d <- d[-7, ] # Remove TYDK-1
+datatable(d, options = list(scrollX = TRUE))
+```
+
+## Buid DGE
+Read and merge files containing gene expression counts.
+```{r}
+y <- readDGE(d$sampleFiles, path=directory, group=d$Group, header=FALSE)
+# colnames(y$counts) <- group
+```
+
+## Gene annotation
+Read the pre-compiled annotation_tab, and add the annotation to the DGEList. There is no Name for the Giardia annotation.
+```{r}
+annotation <- read.csv(file=annotation_tab, head=TRUE, sep="\t")
+sub_annotation <- annotation[match(rownames(y$counts), annotation$Geneid), ]
+y$genes <- sub_annotation
+```
+
+## Data filtering
+Only genes with reasonable expression level should be included in the analysis. Keep genes with at least 2 count per million in at least 3 samples (replicates).
+
+```{r}
+CPM <- cpm(y)
+# summary(CPM)
+
+keep <- rowSums(CPM>2) >= 3 # 
+table(keep)
+y <- y[keep, , keep.lib.sizes=FALSE]
+# Remove tr RNAs, apparently not affecting the results
+y <- y[grep("GL50803_[0123456789]", rownames(y)), , keep.lib.sizes=FALSE]
+```
+ 
+
+## Library sizes
+Plot number of reads matched per sample, and total for each gene across all samples. The high peak in the counts per genes are the ribosomal RNAs.
+```{r, fig.width=9, fig.height=3}
+counts_per_sample <- colSums(y$counts)
+barplot(counts_per_sample*1e-6, las=2, main="Counts per sample", cex.names=0.5, cex.axis=0.8, ylab="Library size (millions)")
+barplot(rowSums(y$counts), las=2, main="Counts per gene", axisnames=FALSE, cex.axis=0.8, ylab="Counts")
+```
+
+## Normalization
+The raw library sizes were normalized with a scaling factor for each sample that aims to minimize the fold changes between the samples for the majority of the genes. Ideally all scaling factors should be around 1. TMM the default method was used.
+
+```{r, fig.width=9, fig.height=6}
+group.col <- group
+levels(group.col) <- brewer.pal(length(levels(group.col)), "Set2")
+logCPM_prenorm <- cpm(y, log = TRUE, prior.count = 2)
+median_prenorm <- rowMedians(logCPM_prenorm)
+```
+We can see the lib.size are quite equivalent, and normalization factors are also around 1.
+
+```{r}
+y <- calcNormFactors(y)
+y$samples
+logCPM_postnorm <- cpm(y, log = TRUE, prior.count = 2)
+median_postnorm <- rowMedians(logCPM_postnorm)
+logCPM <- logCPM_postnorm
+```
+Below we can compare the different libraries before and after normalizations.
+Relative Log Expression (RLE) plots are powerful tool for visalizaing unwanted variation in high dimensional data. Ideally all boxplots should be centered around 0 and be of similar width. Compare the boxplots before and after normaliztion, we can see the normalization worked well for this data.
+
+```{r, fig.width=9, fig.height=6}
+boxplot(sweep(logCPM_prenorm, 1, median_prenorm, "-"), col = as.character(group.col), 
+        las = 2, main = "RLE plot pre-normalization")
+abline(h = 0, lty = 2)
+
+boxplot(sweep(logCPM_postnorm, 1, median_postnorm, "-"), col = as.character(group.col), 
+        las = 2, main = "RLE plot post-normalization")
+abline(h = 0, lty = 2)
+```
+
+
+
+# Data exploration
+## Sample clustering
+The MDS plot shows the unsupervised clustering of the samples. It's a two-dimensional scatterplot that distances on the plot approximate the typical log2 fold changes between the samples based the top 500 most variable genes between each pair of samples. On this plot, we can see that samples from the same hours do cluster together. But batch effect can not be excluded, which will be discussed later. 
+
+```{r}
+plotMDS(y, col = as.character(group.col))
+```
+
+## Biological variation
+The square root of the common dispersion gives the coefficient of variation of biological variation (BCV). The BCV indicates how the abundance of each gene varies between replicate samples. The common BCV for the data set:
+
+```{r}
+design <- model.matrix(~0+d$Group)
+colnames(design) <- levels(d$Group)
+y <- estimateDisp(y, design, robust=TRUE)
+y$common.dispersion
+```
+The number is low and good. A plot of the averge $\log_2$CPM versus the BCV for each gene is shown below. The plot visualises how gene variation between replicate samples (BCV) changes as gene abundance ($\log_2$ counts per million) increase. We can see the trended dispersion shows a decreasing trend with expression level. Only the trended dispersion is used under the quasi-likelihood (QL) pipeline.
+```{r}
+plotBCV(y)
+# HV <- y[y$prior.df == min(y$prior.df), ]
+# points(HV$AveLogCPM, sqrt(HV$tagwise.dispersion), pch = 16, col = "red", cex = 0.8)
+# text(HV$AveLogCPM, sqrt(HV$tagwise.dispersion), labels = HV$genes$Geneid, col = "red", 
+#     cex = 0.7, pos = 4)
+```
+## Dispersion estimation
+The QL dispersions can be estimated using a genewise negative binomial generalized linear models with Quasi-likelihood test (glmQLFit), and then be visualized with the plotQLDisp function. The big sample size variation cause the QL dispersions are squeezed very heavily from the raw values.
+The data is transformed to $\log_2$CPM.
+
+```{r}
+fit <- glmQLFit(y, design, robust=TRUE)
+plotQLDisp(fit)
+```
+
+# Differential expression analysis
+
+QL F-test (glmQLFTest) were used to determine significant differential expression. The QL F-test is preferred as it reflects the uncertainty in estimating the dispersion for each gene. It also provides more robust and reliable error rate control when the number of replicates is small.
+## Contrasts
+Comparisons of interest listed below. Contrast defines the null hypothesis as the comparison intersted to be equal to zero.
+```{r}
+my.contrasts <- makeContrasts(
+  NoFerric = NoFerric - Control,
+  IronInh = IronInh - Control,
+  IronInhvsNoFerric = IronInh - NoFerric,
+  levels=design)
+
+
+```
+
+```{r}
+qlf_dictionary <- function(fit, my.contrasts, ...) {
+  # To pair up contrast and qlf
+  qlf_d <- list()
+  for (contrast in dimnames(my.contrasts)$Contrasts) {
+    qlf <- glmQLFTest(fit, contrast=my.contrasts[, contrast])
+    qlf_d <- c(qlf_d, list(name = qlf))
+  }
+  names(qlf_d) <- dimnames(my.contrasts)$Contrasts
+  return(qlf_d)
+}
+```
+
+```{r}
+plot_logFCvslogCPM <- function(qlf, contrast, ...) { 
+  cat("\n### Log-fold change against log-counts per million\n")
+  cat("The test results are visualized in te following smear plot. Genes that are significantly DE with an FDR of 5% are highlighted in red and blue.\n\n")
+  plotMD(qlf, main=contrast)
+  abline(h=c(-1,1), col="blue")
+}
+```
+
+```{r}
+plot_pheatmap <- function(qlf, summ, contrast, ...) {
+  cat("\n\n### Heatmap of the moderated log-counts-per-million\n")
+  cat("\nHeatmap of the moderated log-counts-per-million of the DE genes in this comparison.")
+  size <- sum(summ[c(1,3)])
+  if (size == 0) return()
+  DE.top <- topTags(qlf, n=size, sort.by="logFC")
+  top.genes <- row.names(DE.top)
+  top.logcpm <- logCPM[top.genes, ]
+  pheatmap(top.logcpm, cluster_cols = FALSE,
+           show_rownames=FALSE, color=bwColors(100), main=paste(contrast, "log-counts-per-million", tag))
+}
+```
+
+
+
+```{r}
+plot_valcano <- function(all.genes.t, contrast, ...) {
+  cat("\n\n### Volcano plot\n")
+  cat("A volcano plot the fold change on the x-axis and the statistial significance on the y-axis (the -log10 of the p-value. Genes that are highly dysregulated are farther to the left and right sides, while highly significant changes appear higher on the plot. Genes with FDR<0.05 are colored red, and abs(logFC)>1 are colored orange, and green if both.\n\n")
+  with(all.genes.t, plot(logFC, -log10(PValue), pch=20, main=paste("Volcano plot", contrast)))
+  with(subset(all.genes.t, FDR<.05 ), points(logFC, -log10(PValue), pch=20, col="red"))
+  with(subset(all.genes.t, abs(logFC)>1), points(logFC, -log10(PValue), pch=20, col="orange"))
+  with(subset(all.genes.t, FDR<.05 & abs(logFC)>1), points(logFC, -log10(PValue), pch=20, col="green"))
+}
+```
+
+
+```{r}
+export_DE <- function(DE.genes.t, contrast, ...) {
+  cat("\n\n### Export significant cases\n")
+  cat("The table lists all the DE with abs(logFC) > 1 and FDR< 0.05. \n\n")
+  
+  colSize = ncol(DE.genes.t)
+  # Workaround in printing table
+  print(
+    htmltools::tagList(
+      datatable(DE.genes.t[abs(DE.genes.t$logFC) > 1, ], rownames = FALSE, 
+                options = list(scrollX = TRUE)) %>%
+        formatStyle(columns = c(1:colSize), fontSize = '80%') %>%
+        formatSignif(c(8:colSize), 2) %>%
+        formatRound(c(5:7), 2)
+    )
+  )
+  
+  DE.genes.t <- format(DE.genes.t, trim=TRUE, digits=2, nsmall=2)
+  write.csv(DE.genes.t, file=paste(directory, "sig_results", tag, ".", contrast, ".tab", sep=""), 
+            row.names = FALSE)
+
+}
+```
+
+```{r}
+export_cpm <- function(DE.genes.t, contrast, ...) {
+  cat("\n\n### Export logCPM values of the DE\n")
+  cat("Inspect the depth-adjusted reads per million for the top differentially expressed. \n\n")
+  
+  DE.cpm <- logCPM[rownames(DE.genes.t),]
+  if (nrow(DE.genes.t) == 1) {
+    # numeric instead of matrix
+    DE.cpm <- matrix(DE.cpm, nrow=1)
+    colnames(DE.cpm) <- group
+  }  
+  
+  colSize <- ncol(DE.cpm)
+  print(
+    htmltools::tagList(
+      datatable(DE.cpm, options = list(scrollX = TRUE)) %>%
+                formatStyle(columns = c(1:colSize), fontSize = '80%') %>%
+                formatRound(c(1:colSize), 1)
+    )
+  ) 
+  
+  DE.cpm <- format(DE.cpm, digits=2, nsmall=1)
+  write.csv(DE.cpm, file=paste(directory, "sig_results", tag, ".cpm.", contrast, ".csv", sep=""))
+}
+```
+
+```{r}
+# generate dictionary of contrast:qlf
+qlf_d <- qlf_dictionary(fit, my.contrasts)
+```
+
+```{r, results="asis", fig.show='asis', message=F, warning=F, fig.width=8}
+tag = ""
+result_summary <- matrix(, nrow=3, ncol=0) # DE number summary
+result_logFC1_summary <- matrix(, nrow=2, ncol=0) # DE with abs(logFC)>1 summary
+DT_mat <- matrix(, nrow=nrow(fit), ncol=0) # DE as 1, 0, -1
+logFC_mat <- matrix(, nrow = nrow(fit), ncol = 0) # logFC matrix for heatmap
+for (contrast in names(qlf_d) ) {
+  cat("##", contrast, "\n")
+  qlf <- qlf_d[[contrast]]
+  dt <- decideTestsDGE(qlf) # Decides DE with p.value <0.05, return matrix of 1, 0, -1
+  summ <- summary(dt)
+  row.names(summ) <- c("Down", "Not-sig", "Up")
+  result_summary <- cbind(result_summary, summ)
+  colnames(dt) <- contrast
+  DT_mat <- cbind(DT_mat, dt)
+  isDE <- as.logical(dt)
+  DEnames <- rownames(y)[isDE]
+  
+  all.genes <- topTags(qlf, n=Inf, sort.by="logFC") # Return a list containing a data.frame table
+  all.genes.t <- all.genes$table
+  all.genes.t.logFC <- all.genes[, 'logFC']$table
+   if (length(logFC_mat) == 0) {
+    logFC_mat <- all.genes.t.logFC
+  } else {
+    logFC_mat <- cbind(logFC_mat, 
+                       all.genes.t.logFC[match(rownames(logFC_mat), 
+                                               rownames(all.genes.t.logFC)), ])
+  }
+  DE.genes <- all.genes[DEnames,]
+  DE.genes.t <- DE.genes$table
+  DE.genes.t <- DE.genes.t[order(abs(DE.genes.t$logFC), decreasing=TRUE),]
+  logFC_summ <- matrix(c(nrow(DE.genes.t[DE.genes.t$logFC < -1,]),
+                      nrow(DE.genes.t[DE.genes.t$logFC > 1,])),
+                    nrow=2, ncol=1)
+  result_logFC1_summary <- cbind(result_logFC1_summary, logFC_summ)
+  
+  plot_logFCvslogCPM(qlf, contrast)
+  plot_pheatmap(qlf, summ, contrast)
+  plot_valcano(all.genes.t, contrast)
+  export_DE(DE.genes.t, contrast)
+  export_cpm(DE.genes.t, contrast)
+}
+
+colnames(logFC_mat) <- dimnames(my.contrasts)$Contrasts
+colnames(result_summary) <- dimnames(my.contrasts)$Contrasts
+colnames(result_logFC1_summary) <- dimnames(my.contrasts)$Contrasts
+```
+
+## Summary of DE genes
+Genes that are DE are the ones with adjusted p-value (same as FDR in the table) less than a defined false discovery (FDR) rate. The adjusted p-value is used as opposed to the initial p-value as it has been adjusted for multiple testing. The FDR cutoff is set at 0.05. So genes with adjusted p-value < 0.05 is considered as DE, which were further classified into up- or down- regulated. Up-regulated genes has a positve log-fold change, while down-regulated genes has a negative log-fold change. DE with abs(logFC) > 1 was also show below.
+
+```{r}
+rownames(result_logFC1_summary) <- c("Down.logFC<-1", "Up.logFC>1")
+merged_summary <- cbind(t(result_summary[-2,]), t(result_logFC1_summary))
+datatable(merged_summary)
+```
+
+## Heatmap of the logFC 
+Heatmap of the logFC of the DE genes as well as heatmap of the top, `r topX`, genes.
+```{r}
+# subset logFC_mat to DE logFC_mat
+DT_mat_DE <- DT_mat[apply(DT_mat[, -1], MARGIN=1, function(x) any(abs(x) == 1)), ]
+
+logFC_mat[logFC_mat < -thr] <- -thr
+logFC_mat[logFC_mat > thr] <- thr
+logFC_mat_sub <- logFC_mat[rownames(DT_mat_DE),]
+pheatmap(logFC_mat_sub,  
+         breaks=seq(from=-thr, to=thr, length=101), 
+         cluster_cols=FALSE,
+         show_rownames=FALSE, treeheight_row=0, treeheight_col=0,
+         main=paste("Heatmap of logFC for the DE genes", tag))
+
+```
+
+## Venn Diagram
+Venn Diagram of the three most interested comparisons with multiple DE. Note the numbers do not agree between both venn diagrams. The second diagram shows only those genes that were either up in both samples or down in both samples.
+The first diagram also includes genes that were up in one sample and down in the other, which is a less restrictive criterion. 
+And the total numbers in each contrast do add up the same.
+```{r}
+DT_mat_interested <- DT_mat[, c("NoFerric", 
+                                "IronInh")]
+vennDiagram(DT_mat_interested, cex = c(1, 1, 0.8), main = "Common/unique DE genes")
+```
+```{r}
+vennDiagram(DT_mat_interested, cex = c(1, 1, 0.8), include = c("up", "down"), counts.col = c("red", 
+    "blue"), main = "Common/uniquly regulated genes")
+```
+
+

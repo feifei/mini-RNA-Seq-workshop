@@ -1,0 +1,753 @@
+---
+title: "edgeR for DE analysis of Gallus part"
+author: "Feifei Xu"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+    number_sections: true
+    df_print: paged
+    code_folding: hide
+    fig_width: 6
+    fig_height: 6
+---
+
+```{r, include=FALSE}
+library(knitr)
+opts_knit$set(progress = FALSE, verbose = FALSE)
+opts_chunk$set(warning=FALSE, message=FALSE, echo=FALSE)
+
+## this function is basically creating chunks within chunks, and then
+## I use results='asis' so that the html image code is rendered 
+# kexpand <- function(ht, cap) {
+#   cat(knit(text = knit_expand(text = 
+#      sprintf("```{r %s, fig.height=%s, fig.cap='%s'}\n.pl\n```", cap, ht, cap)
+# )))}
+```
+```{r}
+library(gtools)
+library(limma)
+library(edgeR)
+library(pheatmap)
+library(biomaRt)
+library(ggplot2)
+library(colorspace)
+library(RColorBrewer)
+library(matrixStats)
+library(DT)
+library(GO.db)
+library(goseq)
+library(reshape2)
+```
+
+
+# Background
+This report provides the analysis of RNA-Seq data from Eimeria infected chickens, only the gallus part. Eimeria part is presented in another file. The data were collected at different time point, with first a 10 sample pilot study done 2016, and now a more complete study with more (in total 33) samples and more time points and more replicates. Details of the data can be found in data section. Analysis was done with edgeR.
+
+
+# Data preparation
+The RNA-Seq was sequenced in two runs. First 10 samples were sequenced in 1 lane (available 2016-10-27), and the rest 29 samples were sequenced in 3 lanes (available 2017-09-12).
+
+Gallus and Eimeria reference genomes were downloaded from Ensemble (v. 5.0 release 86, <font size="2" type="courier">Gallus_gallus.Gallus_gallus-5.0.dna.toplevel.fa</font>) and ToxoDB (v. 29, 2016-10-13, <font size="2" type="courier">ToxoDB-29_EtenellaHoughton_Genome.fasta</font>), separately.
+
+RNA-Seq reads were mapped with STAR, and htseq-count was used to extract the raw counts from the mapped .BAM files.
+
+## Specify some pararmeters, directory and files
+Specify annotation file, meta data file, and the previously compiled ensembl genes, length info, as well as the corresponding GO terms for the genes.
+```{r}
+name <- "gallus"
+topX <- 500 # to display in the final heatmap
+thr <- 5 # Set max/min logFC change in the heatmap
+bwColors <- colorRampPalette(c("white", "darkblue")) #?
+
+load("RData/length_go.rda")
+# allgenes.Ensembl
+load("/Volumes/Molev/data/Eimeria/GO/allgenes.Ensembl86.rda")
+
+directory <- "/Volumes/Molev/data/Eimeria/edgeR2/"
+annotation_tab <- paste("../data/", name, "_annotation.tab", sep="") # eimeria annotation
+meta_file <- paste(directory, "metadata.csv", sep="")
+```
+
+## Data summary
+```{r}
+d <- read.csv2(meta_file)
+
+sampleFiles <- paste("star_", d$Identifier, ".", name, ".counts", sep="")
+d$sampleFiles <- sampleFiles
+d <- d[-c(39), ] # Remove the one with only Eimeria control
+d <- d[with(d, order(Hour, Condition)), ] # Sorting, first by hour, then by condition
+
+sampleNames <- substr(d$sampleFiles, 1, nchar(d$sampleFiles) - 7)
+# rownames(d) = sampleNames
+group <- factor(paste(d$Condition,d$Hour,sep="_"))
+d <- cbind(d,Group=group)
+datatable(d, options = list(scrollX = TRUE))
+```
+
+## Read counts distribution
+Plot the read counts distribution of the gallus and eimeria
+```{r, fig.height=5, fig.width=9}
+barplot(t(as.matrix(cbind(d$Eimeria.reads, d$Gallus.reads))), col=c("blue", "green"), border=NA,
+        legend.text = c("Eimera", "Gallus"), args.legend=list(bty="n", border=NA),
+        ylab="Read Counts", names.arg=d$Group, las=2, cex.names=0.8)
+```
+
+
+## Buid DGE
+Read and merge files containing gene expression counts.
+```{r}
+y <- readDGE(d$sampleFiles, path=directory, group=d$Group, header=FALSE)
+colnames(y$counts) <- group
+```
+
+## Gene annotation
+Read the pre-compiled annotation_tab, and add the annotation to the DGEList.
+```{r}
+annotation <- read.csv(file=annotation_tab, head=TRUE, sep="\t")
+sub_annotation <- annotation[match(rownames(y$counts), annotation$Geneid), ]
+y$genes <- sub_annotation
+```
+
+## Data filtering
+Only genes with reasonable expression level should be included in the analysis. Keep genes with at least 2 count per million in at least 3 samples (replicates).
+
+```{r}
+CPM <- cpm(y)
+# summary(CPM)
+
+keep <- rowSums(CPM>2) >= 3 # 
+table(keep)
+y <- y[keep, , keep.lib.sizes=FALSE]
+```
+
+## Library sizes
+Plot number of reads matched per sample, and total for each gene across all samples. Library sizes vary from 10 to 50 millions. Some genes are way over expressed compared to the majority.
+```{r, fig.width=9, fig.height=3}
+counts_per_sample <- colSums(y$counts)
+names(counts_per_sample) <- d$Hour
+cols <- as.numeric(d$Condition)+2
+barplot(counts_per_sample*1e-6, las=2, main="Counts per sample", col=cols, cex.names=0.5, cex.axis=0.8, ylab="Library size (millions)")
+legend("topright", legend=c("Control", "Infected"), col=c(3,4), pch=15)
+barplot(rowSums(y$counts)*1e-6, las=2, main="Counts per gene", axisnames=FALSE, cex.axis=0.8, ylab="Counts (millions)")
+```
+
+## Normalization
+The raw library sizes were normalized with a scaling factor for each sample that aims to minimize the fold changes between the samples for the majority of the genes. Ideally all scaling factors should be around 1. TMM the default method was used.
+
+```{r, fig.width=9, fig.height=6}
+group.col <- group
+levels(group.col) <- c(brewer.pal(12, "Set3"), "#A7A7A7") # Set3 has max 12 colors
+logCPM_prenorm <- cpm(y, log = TRUE, prior.count = 2)
+median_prenorm <- rowMedians(logCPM_prenorm)
+```
+
+We can see the lib.size are fairly consistent, and normalization factors are all quite close to 1, indicating good library quality.
+
+```{r}
+y <- calcNormFactors(y)
+y$samples
+logCPM_postnorm <- cpm(y, log = TRUE, prior.count = 2)
+median_postnorm <- rowMedians(logCPM_postnorm)
+logCPM <- logCPM_postnorm
+```
+Below we can compare the different libraries before and after normalizations.
+Relative Log Expression (RLE) plots are powerful tool for visalizaing unwanted variation in high dimensional data. Ideally all boxplots should be centered around 0 and be of similar width. Compare the boxplots before and after normaliztion, we can see that normalization did a good job. One of the control_24 seems to be most different from the rest.
+```{r, fig.width=9}
+boxplot(sweep(logCPM_prenorm, 1, median_prenorm, "-"), col = as.character(group.col), 
+        las = 2, main = "RLE plot pre-normalization")
+abline(h = 0, lty = 2)
+
+boxplot(sweep(logCPM_postnorm, 1, median_postnorm, "-"), col = as.character(group.col), 
+        las = 2, main = "RLE plot post-normalization")
+abline(h = 0, lty = 2)
+```
+
+
+
+
+
+# Data exploration
+## Sample clustering
+The MDS plot shows the unsupervised clustering of the samples. It's is a two-dimensional scatterplot that distances on the plot approximate the typical log2 fold changes between the samples based the top 500 most variable genes between each pair of samples. On this plot, we can see that all samples are not distinctively apart, while samples from the same hours seem to cluster more together in most cases. It's difficult to see any distinct batch effect from this plot, but it can not be excluded. We will discuss the batch effort later. 
+
+```{r}
+plotMDS(y, col = as.character(group.col), xlim = c(-2.5, 2.5), ylim = c(-2, 1.5))
+```
+
+## Biological variation
+The square root of the common dispersion gives the coefficient of variation of biological variation (BCV). The BCV indicates how the abundance of each gene varies between replicate samples. The common BCV for the data set:
+
+```{r}
+design <- model.matrix(~0+group)
+colnames(design) <- levels(group)
+y <- estimateDisp(y, design, robust=TRUE)
+y$common.dispersion
+```
+The number is on high side, but considering the complex of the experiment setup, it's probably normal. A plot of the averge $\log_2$CPM versus the BCV for each gene is shown below. The plot visualises how gene variation between replicate samples (BCV) changes as gene abundance ($\log_2$ counts per million) increase. We can see the trended dispersion shows a decreasing trend with expression level. Only the trended dispersion is used under the quasi-likelihood (QL) pipeline.
+```{r}
+plotBCV(y)
+# HV <- y[y$prior.df == min(y$prior.df), ]
+# points(HV$AveLogCPM, sqrt(HV$tagwise.dispersion), pch = 16, col = "red", cex = 0.8)
+# text(HV$AveLogCPM, sqrt(HV$tagwise.dispersion), labels = HV$genes$Geneid, col = "red", 
+#     cex = 0.7, pos = 4)
+```
+
+```{r eval=FALSE, echo=FALSE}
+RPKM <- rpkm(y)
+HV_HL <- as.factor(y$genes$Geneid %in% HV$genes$Geneid)
+levels(HV_HL) <- c(0, 1)
+glXYPlot(x = y$AveLogCPM, y = sqrt(y$tagwise.dispersion), groups = group, 
+    samples = targets$SampleID, anno = DGE$genes, xlab = "Average logCPM", ylab = "Biological coefficient of variation", 
+    counts = RPKM, side.main = "Symbol", side.ylab = "RPKM", sample.cols = as.character(group.col), 
+    html = "glimma_BCV", status = as.numeric(as.character(HV_HL)), launch = FALSE)
+```
+
+## Dispersion estimation
+The QL dispersions can be estimated using a genewise negative binomial generalized linear models with Quasi-likelihood test (glmQLFit), and then be visualized with the plotQLDisp function. The large number of cases and the high variability means that the QL dispersions are not squeezed very heavily from the raw values
+The data is transformed to $\log_2$CPM.
+
+```{r}
+fit <- glmQLFit(y, design, robust=TRUE)
+plotQLDisp(fit)
+```
+
+# Differential expression analysis
+QL F-test (glmQLFTest) were used to determine significant differential expression. The QL F-test is preferred as it reflects the uncertainty in estimating the dispersion for each gene. It also provides more robust and reliable error rate control when the number of replicates is small.
+## Contrasts
+Comparisons of interest listed below. Contrast defines the null hypothesis as the comparison intersted to be equal to zero.
+```{r}
+my.contrasts <- makeContrasts(
+  # Compare every time point to 0.
+  Control_2vs0 = Control_2 - Control_0,
+  Control_4vs0 = Control_4 - Control_0,
+  Control_12vs0 = Control_12 - Control_0,
+  Control_24vs0 = Control_24 - Control_0,
+  Control_48vs0 = Control_48 - Control_0,
+  Control_72vs0 = Control_72 - Control_0,
+  
+  # 0h infection is basically 0h control
+  Infected_2vs0 = Infected_2 - Control_0,
+  Infected_4vs0 = Infected_4 - Control_0,
+  Infected_12vs0 = Infected_12 - Control_0,
+  Infected_24vs0 = Infected_24 - Control_0,
+  Infected_48vs0 = Infected_48 - Control_0,
+  Infected_72vs0 = Infected_72 - Control_0,
+  
+  Infected_4vs2 = Infected_4 - Infected_2,
+  Infected_12vs4 = Infected_12 - Infected_4,
+  Infected_24vs12 = Infected_24 - Infected_12,
+  Infected_48vs24 = Infected_48 - Infected_24,
+  Infected_72vs48 = Infected_72 - Infected_48,
+  
+  # Genes with baseline differences between the infection and the control
+  InfectedvsControl_2 = Infected_2 - Control_2, # = Infected_2vs0 - Control_2vs0 
+  InfectedvsControl_4 = Infected_4 - Control_4,
+  InfectedvsControl_12 = Infected_12 - Control_12,
+  InfectedvsControl_24 = Infected_24 - Control_24,
+  InfectedvsControl_48 = Infected_48 - Control_48,
+  InfectedvsControl_72 = Infected_72 - Control_72,
+  
+  # Genes with difference in each infection interval
+  InfectedvsControl_2vs0 = Infected_2 - Control_2,
+  InfectedvsControl_4vs2 = (Infected_4 - Control_4) - (Infected_2 - Control_2),
+  InfectedvsControl_12vs4 = (Infected_12 - Control_12) - (Infected_4 - Control_4),
+  InfectedvsControl_24vs12 = (Infected_24 - Control_24) - (Infected_12 - Control_12),
+  InfectedvsControl_48vs24 = (Infected_48 - Control_48) - (Infected_24 - Control_24),
+  InfectedvsControl_72vs48 = (Infected_72 - Control_72) - (Infected_48 - Control_48),
+levels=design)
+
+colnames(my.contrasts)
+```
+
+
+
+```{r}
+qlf_dictionary <- function(fit, my.contrasts, ...) {
+  # To pair up contrast and qlf
+  qlf_d <- list()
+  for (contrast in dimnames(my.contrasts)$Contrasts) {
+    qlf <- glmQLFTest(fit, contrast=my.contrasts[, contrast])
+    qlf_d <- c(qlf_d, list(name = qlf))
+  }
+  names(qlf_d) <- dimnames(my.contrasts)$Contrasts
+  return(qlf_d)
+}
+```
+
+```{r}
+plot_logFCvslogCPM <- function(qlf, contrast, ...) { 
+  cat("\n### Log-fold change against log-counts per million\n")
+  cat("The test results are visualized in te following smear plot. Genes that are significantly DE with an FDR of 5% are highlighted in red and blue.\n\n")
+  plotMD(qlf, main=contrast)
+  abline(h=c(-1,1), col="blue")
+}
+```
+
+```{r}
+plot_pheatmap <- function(qlf, summ, contrast, ...) {
+  cat("\n\n### Heatmap of the moderated log-counts-per-million\n")
+  cat("\nHeatmap of the moderated log-counts-per-million of the DE genes in this comparison.")
+  size <- sum(summ[c(1,3)])
+  if (size == 0) return()
+  DE.top <- topTags(qlf, n=size, sort.by="logFC")
+  top.genes <- row.names(DE.top)
+  top.logcpm <- logCPM[top.genes, ]
+  pheatmap(top.logcpm, cluster_cols = FALSE,
+           show_rownames=FALSE, color=bwColors(100), main=paste(contrast, "log-counts-per-million", tag))
+}
+```
+
+
+
+```{r}
+plot_valcano <- function(all.genes.t, contrast, ...) {
+  cat("\n\n### Volcano plot\n")
+  cat("A volcano plot the fold change on the x-axis and the statistial significance on the y-axis (the -log10 of the p-value. Genes that are highly dysregulated are farther to the left and right sides, while highly significant changes appear higher on the plot. Genes with FDR<0.05 are colored red, and abs(logFC)>1 are colored orange, and green if both.\n\n")
+  with(all.genes.t, plot(logFC, -log10(PValue), pch=20, main=paste("Volcano plot", contrast)))
+  with(subset(all.genes.t, FDR<.05 ), points(logFC, -log10(PValue), pch=20, col="red"))
+  with(subset(all.genes.t, abs(logFC)>1), points(logFC, -log10(PValue), pch=20, col="orange"))
+  with(subset(all.genes.t, FDR<.05 & abs(logFC)>1), points(logFC, -log10(PValue), pch=20, col="green"))
+}
+```
+
+
+```{r}
+export_DE <- function(DE.genes.t, contrast, ...) {
+  cat("\n\n### Export significant cases\n")
+  cat("The table lists all the DE with abs(logFC) > 1 and FDR< 0.05. \n\n")
+  
+  colSize = ncol(DE.genes.t)
+  # Workaround in printing table
+  print(
+    htmltools::tagList(
+      datatable(DE.genes.t[abs(DE.genes.t$logFC) > 1, ], rownames = FALSE, 
+                options = list(scrollX = TRUE)) %>%
+        formatStyle(columns = c(1:colSize), fontSize = '80%') %>%
+        formatSignif(c(8:colSize), 2) %>%
+        formatRound(c(5:7), 2)
+    )
+  )
+  
+  DE.genes.t <- format(DE.genes.t, trim=TRUE, digits=2, nsmall=2)
+  write.csv(DE.genes.t, file=paste(directory, name, "_sig_results", tag, ".", contrast, ".csv", sep=""), 
+            row.names = FALSE)
+
+}
+```
+```{r}
+export_all <- function(all.genes.t, contrast, ...) {
+  cat("\n\n### Export all genes\n")
+  cat("The table lists all the genes. \n\n")
+  
+  all.genes.t <- format(all.genes.t, trim=TRUE, digits=2, nsmall=2)
+  write.csv(all.genes.t, file=paste(directory, name, "_all", tag, ".", contrast, ".csv", sep=""), 
+            row.names = FALSE)
+
+}
+```
+
+```{r}
+export_cpm <- function(DE.genes.t, contrast, ...) {
+  cat("\n\n### Export logCPM values of the DE\n")
+  cat("Inspect the depth-adjusted reads per million for the top differentially expressed. \n\n")
+  
+  DE.cpm <- logCPM[rownames(DE.genes.t),]
+  if (nrow(DE.genes.t) == 1) {
+    # numeric instead of matrix
+    DE.cpm <- matrix(DE.cpm, nrow=1)
+    colnames(DE.cpm) <- group
+  }  
+  
+  colSize <- ncol(DE.cpm)
+  print(
+    htmltools::tagList(
+      datatable(DE.cpm, options = list(scrollX = TRUE)) %>%
+                formatStyle(columns = c(1:colSize), fontSize = '80%') %>%
+                formatRound(c(1:colSize), 1)
+    )
+  ) 
+  
+  DE.cpm <- format(DE.cpm, digits=2, nsmall=1)
+  write.csv(DE.cpm, file=paste(directory, name, "_sig_results", tag, ".cpm.", contrast, ".csv", sep=""))
+}
+```
+
+```{r}
+go_enrich_plot <- function(genes, lengthData, contrast, extra_tag = "", ...) {
+  # Find GO enrichment, and plot term vs num
+  pwf=nullp(genes, bias.data=lengthData, plot.fit=FALSE)
+  GO.wall=goseq(pwf,gene2cat=GOmap)
+  
+  GO.wall.sub = GO.wall[GO.wall$numDEInCat >= 5 | p.adjust(GO.wall$over_represented_pvalue, method="BH")<1,]
+  if (nrow(GO.wall.sub) <= 1) return()
+  GO.wall.sub$term <- reorder(GO.wall.sub$term, GO.wall.sub[-1]$numDEInCat)
+  GO.wall.sub.m <- melt(GO.wall.sub, id=c("category","term", "over_represented_pvalue","under_represented_pvalue","ontology"))
+  
+  # GO.wall.sub$ontology[is.na(GO.wall.sub$ontology)] <- "NA"
+  GO.wall.sub.sub <- head(GO.wall.sub[order(GO.wall.sub$numDEInCat,decreasing=TRUE),], n = 50)
+  p <- ggplot(subset(GO.wall.sub.sub, !is.na(ontology)), 
+              aes(term, numDEInCat, fill=ontology))
+  # p <- ggplot(GO.wall.sub, aes(term, numDEInCat, fill=ontology))
+  p <- p + geom_bar(stat="identity", position=position_dodge()) +
+                 coord_flip() + labs(title=paste(contrast, extra_tag, tag)) +
+                 scale_x_discrete(label=function(x) substr(x, 1, 40))
+  return (list("GO.wall" = GO.wall, "GO.wall.sub.m" = GO.wall.sub.m, "plot" = p))
+}
+```
+
+
+```{r}
+go_up_down <- function(up_down, genes, lengthData, contrast, extra_tag, ...) {
+  sub_up_down <- up_down[up_down %in% names(lengthData)]
+  sub_genes <- as.integer(names(genes) %in% sub_up_down)
+  names(sub_genes) <- names(genes)
+  g <- go_enrich_plot(sub_genes, lengthData, contrast, extra_tag)
+  if (is.null(g)) return()
+  p <- g$plot
+  GO.wall = g$GO.wall
+  GO.wall.sub.m = g$GO.wall.sub.m
+
+  if (length(unique(GO.wall.sub.m$ontology)) == 3) {
+    p <- p + scale_fill_manual(values=c("#F8766D", "#00BA38", "#999999"))
+  } else {
+    p <- p + scale_fill_manual(values=c("#F8766D", "#00BA38", "#619CFF", "#999999"))
+  }
+  print (p)
+  cat('\r\n\r\n')
+  
+  enriched.GO=GO.wall$category[p.adjust(GO.wall$over_represented_pvalue, method="BH")<.05]
+  if (length(enriched.GO) == 0) return()
+  cat("------------ Enriched", extra_tag, "-regulated GO ------------\r\n")
+  print(enriched.GO)
+  cat("\n")
+  for(go in enriched.GO){
+    goterm <- GOTERM[[go]]
+    if (!is.null(goterm)) {
+      cat("GOID: ", GOID(goterm), "\n")
+      cat("Term: ", Term(goterm), "\n")
+      cat("Ontology: ", Ontology(goterm), "\n")
+      cat("Definition: ", Definition(goterm), "\n")
+      cat("--------------------------------------\n\n") 
+    }
+  }
+}
+```
+
+
+```{r}
+go_analysis <- function(isDE, dt, contrast, ...) {
+  ########################
+  # Go enrichment analysis with goseq
+  ########################
+  cat("\n\n\n\n### GO analysis \n\n")
+  genes <- as.integer(isDE)
+  names(genes) <- rownames(y)
+  
+  genes <- genes[!is.na(genes)]
+  sub_genes <- genes[names(genes) %in% names(lengthData_bm)]
+  sub_lengthData <- lengthData_bm[names(lengthData_bm) %in% names(sub_genes)]
+  
+  g <- go_enrich_plot(sub_genes, sub_lengthData, contrast, "")
+  if (is.null(g)) return()
+  p <- g$plot
+  print (p)
+  GO.wall.sub.m = g$GO.wall.sub.m
+  
+  # Plot ontology big class 
+  p <- ggplot(GO.wall.sub.m, aes(ontology, value, fill=variable))
+  print(p + geom_bar(stat="identity", position=position_dodge()) +
+          coord_flip() + labs(title=paste(contrast, tag)))
+  
+  
+  ####
+  # Separate Up and Down regulation
+  up = rownames(y)[which(dt == 1)]
+  down = rownames(y)[which(dt == -1)]
+  if (length(up) > 1){
+    go_up_down(up, sub_genes, sub_lengthData, contrast, "UP")
+  }
+  if (length(down) > 1) {
+    go_up_down(down, sub_genes, sub_lengthData, contrast, "DOWN")
+  }
+}
+```
+
+```{r}
+# generate dictionary of contrast:qlf
+qlf_d <- qlf_dictionary(fit, my.contrasts)
+```
+
+```{r, results="asis", fig.show='asis', message=F, warning=F, fig.width=8}
+tag = ""
+result_summary <- matrix(, nrow=3, ncol=0) # DE number summary
+result_logFC1_summary <- matrix(, nrow=2, ncol=0) # DE with abs(logFC)>1 summary
+DT_mat <- matrix(, nrow=nrow(fit), ncol=0) # DE as 1, 0, -1
+logFC_mat <- matrix(, nrow = nrow(fit), ncol = 0) # logFC matrix for heatmap
+for (contrast in names(qlf_d) ) {
+  cat("##", contrast, "\n")
+  qlf <- qlf_d[[contrast]]
+  dt <- decideTestsDGE(qlf) # Decides DE with p.value <0.05, return matrix of 1, 0, -1
+  summ <- summary(dt)
+  row.names(summ) <- c("Down", "Not-sig", "Up")
+  result_summary <- cbind(result_summary, summ)
+  colnames(dt) <- contrast
+  DT_mat <- cbind(DT_mat, dt)
+  isDE <- as.logical(dt)
+  DEnames <- rownames(y)[isDE]
+  
+  all.genes <- topTags(qlf, n=Inf, sort.by="logFC") # Return a list containing a data.frame table
+  all.genes.t <- all.genes$table
+  all.genes.t.logFC <- all.genes[, 'logFC']$table
+   if (length(logFC_mat) == 0) {
+    logFC_mat <- all.genes.t.logFC
+  } else {
+    logFC_mat <- cbind(logFC_mat, 
+                       all.genes.t.logFC[match(rownames(logFC_mat), 
+                                               rownames(all.genes.t.logFC)), ])
+  }
+  DE.genes <- all.genes[DEnames,]
+  DE.genes.t <- DE.genes$table
+  DE.genes.t <- DE.genes.t[order(abs(DE.genes.t$logFC), decreasing=TRUE),]
+  logFC_summ <- matrix(c(nrow(DE.genes.t[DE.genes.t$logFC < -1,]),
+                      nrow(DE.genes.t[DE.genes.t$logFC > 1,])),
+                    nrow=2, ncol=1)
+  result_logFC1_summary <- cbind(result_logFC1_summary, logFC_summ)
+  
+  plot_logFCvslogCPM(qlf, contrast)
+  plot_pheatmap(qlf, summ, contrast)
+  plot_valcano(all.genes.t, contrast)
+  export_DE(DE.genes.t, contrast)
+  export_all(all.genes.t, contrast)
+  export_cpm(DE.genes.t, contrast)
+  go_analysis(isDE, dt, contrast)
+}
+
+colnames(logFC_mat) <- dimnames(my.contrasts)$Contrasts
+colnames(result_summary) <- dimnames(my.contrasts)$Contrasts
+colnames(result_logFC1_summary) <- dimnames(my.contrasts)$Contrasts
+```
+
+
+## Summary of DE genes
+Genes that are DE are the ones with adjusted p-value (same as FDR in the table) less than a defined false discovery (FDR) rate. The adjusted p-value is used as opposed to the initial p-value as it has been adjusted for multiple testing. The FDR cutoff is set at 0.05. So genes with adjusted p-value < 0.05 is considered as DE, which were further classified into up- or down- regulated. Up-regulated genes has a positve log-fold change, while down-regulated genes has a negative log-fold change. DE with abs(logFC) > 1 was also show below.
+
+```{r}
+rownames(result_logFC1_summary) <- c("Down.logFC<-1", "Up.logFC>1")
+merged_summary <- cbind(t(result_summary[-2,]), t(result_logFC1_summary))
+datatable(merged_summary)
+```
+
+
+## Heatmap of the logFC 
+Heatmap of the logFC of the DE genes as well as heatmap of the top, `r topX`, genes.
+```{r}
+# subset logFC_mat to DE logFC_mat
+ncol_DT_mat <- ncol(DT_mat)
+DT_mat_last <- DT_mat[,c(ncol_DT_mat - 5: ncol_DT_mat)] # DE of the last 6 comparisons
+DT_mat_last_DE <- DT_mat_last[apply(DT_mat_last[, -1], MARGIN=1, function(x) any(abs(x) == 1)), ]
+
+logFC_mat[logFC_mat < -thr] <- -thr
+logFC_mat[logFC_mat > thr] <- thr
+logFC_mat_sub <- logFC_mat[rownames(DT_mat_last_DE),]
+pheatmap(logFC_mat_sub,  
+         breaks=seq(from=-thr, to=thr, length=101), 
+         cluster_cols=FALSE,
+         show_rownames=FALSE, treeheight_row=0, treeheight_col=0,
+         main=paste("Heatmap of logFC for the DE genes", tag))
+
+pheatmap(head(logFC_mat[order(abs(logFC_mat$InfectedvsControl_24), decreasing=TRUE),], topX),  
+         breaks=seq(from=-thr, to=thr, length=101), 
+         cluster_cols=FALSE,
+         show_rownames=FALSE, treeheight_row=0, treeheight_col=0,
+         main=paste("Heatmap of logFC for the top", topX, " genes", tag))
+
+```
+
+
+# Differential expression analysis -BA
+In the Data Exploration part, we talked about the potential of batch effect. In this experiment, there are quite a few batch effect to consider. The experiments started at different time (StartBatch), samples were collected at different time (CollectionDate) and sequenced in two different runs (Run). 
+A good experimental design will be to start all the infection experiments at the same time and do the replicates at a different time. In that case, the major batch effect will be the different time where the different replicates start. This approach was not feasible due to the large sample sizes.
+
+## Sample clustering
+Looking at the sample clustering after removing StartBatch batch effect, samples of the same time points seem to cluster better. Sample clustering after removing Runs batch effect, do not show a sensible change in clustering (figure not shown). It wasn't possible to combine Runs and StarBatch.
+After removing StartBatch batch effect, samples from the same condition and time cluster more togther. The first dimension separates the time points, while the second dimension separate the control vs infection.
+```{r}
+batch1 <- factor(d$StartBatch)
+logCPM <- removeBatchEffect(logCPM,batch=batch1, design=design)
+plotMDS(logCPM, labels = group,
+        col=diverge_hcl(length(levels(batch1)))[factor(batch1)], 
+        main="Batch adjusted, colored after batch", 
+        xlim = c(-2.5, 0.5), ylim = c(-1.5, 2))
+plotMDS(logCPM, labels = group,
+        col=as.character(group.col), 
+        main="Batch adjusted, colored after samples", 
+        xlim = c(-2.5, 0.5), ylim = c(-1.5, 2))
+plotMDS(y, col = as.character(group.col), 
+        main = "Before batch, for comparison",
+        xlim = c(-2.5, 2.5), ylim = c(-2, 1.5))
+
+```
+
+## New design
+New design to include StartBatch. 12h samples are all from the same StartBatch of experiment, so it's not possible to correct batch effect for 12h, thus 12h was removed from the design matrix in the batch adjusted (-BA) analysis.
+
+```{r}
+design <- model.matrix(~0+batch1+group) # New design to include batch as the base
+colnames(design)[8:19] <- levels(group)[2:13]
+design <- design[,-14] # Exclude 12h
+```
+## New contrasts
+```{r}
+my.contrasts <- makeContrasts(
+  Control_2vs0 = Control_2,
+  Control_4vs0 = Control_4,
+  Control_24vs0 = Control_24,
+  Control_48vs0 = Control_48,
+  Control_72vs0 = Control_72,
+
+  # 0h infection is basically 0h control
+  Infected_2vs0 = Infected_2,
+  Infected_4vs0 = Infected_4,
+  Infected_24vs0 = Infected_24,
+  Infected_48vs0 = Infected_48,
+  Infected_72vs0 = Infected_72,
+
+  # Genes with baseline differences between the infection and the control
+  InfectedvsControl_2 = Infected_2 - Control_2, # = Infected_2vs0 - Control_2vs0
+  InfectedvsControl_4 = Infected_4 - Control_4,
+  InfectedvsControl_24 = Infected_24 - Control_24,
+  InfectedvsControl_48 = Infected_48 - Control_48,
+  InfectedvsControl_72 = Infected_72 - Control_72,
+  
+  # Genes with difference in each infection between neighboring time point.
+  InfectedvsControl_2vs0 = Infected_2 - Control_2,
+  InfectedvsControl_4vs2 = (Infected_4 - Control_4) - (Infected_2 - Control_2),
+  InfectedvsControl_24vs4 = (Infected_24 - Control_24) - (Infected_4 - Control_4),
+  InfectedvsControl_48vs24 = (Infected_48 - Control_48) - (Infected_24 - Control_24),
+  InfectedvsControl_72vs48 = (Infected_72 - Control_72) - (Infected_48 - Control_48),
+  
+  levels=design)
+
+colnames(my.contrasts)
+```
+
+## Biological variation
+The common dispersion values gets lower in the batch adjusted model.
+
+```{r}
+y <- estimateDisp(y, design, robust=TRUE)
+y$common.dispersion
+```
+
+```{r}
+plotBCV(y)
+fit <- glmQLFit(y, design, robust=TRUE)
+plotQLDisp(fit)
+```
+
+```{r}
+qlf_d <- qlf_dictionary(fit, my.contrasts)
+
+```
+
+```{r, results="asis", fig.show='asis', message=F, warning=F, fig.width=8}
+tag = "-BA"
+result_summary <- matrix(, nrow=3, ncol=0) # DE number summary
+result_logFC1_summary <- matrix(, nrow=2, ncol=0) # DE with abs(logFC)>1 summary
+DT_mat <- matrix(, nrow=nrow(fit), ncol=0) # DE as 1, 0, -1
+logFC_mat <- matrix(, nrow = nrow(fit), ncol = 0) # logFC matrix for heatmap
+for (contrast in names(qlf_d) ) {
+  cat("##", contrast, "\n")
+  qlf <- qlf_d[[contrast]]
+  dt <- decideTestsDGE(qlf) # Decides DE with p.value <0.05, return matrix of 1, 0, -1
+  summ <- summary(dt)
+  row.names(summ) <- c("Down", "Not-sig", "Up")
+  result_summary <- cbind(result_summary, summ)
+  colnames(dt) <- contrast
+  DT_mat <- cbind(DT_mat, dt)
+  isDE <- as.logical(dt)
+  DEnames <- rownames(y)[isDE]
+  
+  all.genes <- topTags(qlf, n=Inf, sort.by="logFC") # Return a list containing a data.frame table
+  all.genes.t <- all.genes$table
+  all.genes.t.logFC <- all.genes[, 'logFC']$table
+   if (length(logFC_mat) == 0) {
+    logFC_mat <- all.genes.t.logFC
+  } else {
+    logFC_mat <- cbind(logFC_mat, 
+                       all.genes.t.logFC[match(rownames(logFC_mat), 
+                                               rownames(all.genes.t.logFC)), ])
+  }
+  DE.genes <- all.genes[DEnames,]
+  DE.genes.t <- DE.genes$table
+  DE.genes.t <- DE.genes.t[order(abs(DE.genes.t$logFC), decreasing=TRUE),]
+  logFC_summ <- matrix(c(nrow(DE.genes.t[DE.genes.t$logFC < -1,]),
+                      nrow(DE.genes.t[DE.genes.t$logFC > 1,])),
+                    nrow=2, ncol=1)
+  result_logFC1_summary <- cbind(result_logFC1_summary, logFC_summ)
+  
+  plot_logFCvslogCPM(qlf, contrast)
+  plot_pheatmap(qlf, summ, contrast)
+  plot_valcano(all.genes.t, contrast)
+  export_DE(DE.genes.t, contrast)
+  export_all(all.genes.t, contrast)
+  export_cpm(DE.genes.t, contrast)
+  go_analysis(isDE, dt, contrast)
+}
+
+colnames(logFC_mat) <- dimnames(my.contrasts)$Contrasts
+colnames(result_summary) <- dimnames(my.contrasts)$Contrasts
+colnames(result_logFC1_summary) <- dimnames(my.contrasts)$Contrasts
+```
+
+## Summary of DE genes
+Genes that are DE are the ones with adjusted p-value (same as FDR in the table) less than a defined false discovery (FDR) rate. The adjusted p-value is used as opposed to the initial p-value as it has been adjusted for multiple testing. The FDR cutoff is set at 0.05. So genes with adjusted p-value < 0.05 is considered as DE, which were further classified into up- or down- regulated. Up-regulated genes has a positve log-fold change, while down-regulated genes has a negative log-fold change. DE with abs(logFC) > 1 was also show below.
+
+```{r}
+rownames(result_logFC1_summary) <- c("Down.logFC<-1", "Up.logFC>1")
+merged_summary <- cbind(t(result_summary[-2,]), t(result_logFC1_summary))
+datatable(merged_summary)
+```
+
+
+## Heatmap of the logFC 
+Heatmap of the logFC of the DE genes as well as heatmap of the top, `r topX`, genes.
+```{r}
+# subset logFC_mat to DE logFC_mat
+ncol_DT_mat <- ncol(DT_mat)
+DT_mat_last <- DT_mat[,c(ncol_DT_mat - 4: ncol_DT_mat)] # DE of the last 5 comparisons
+DT_mat_last_DE <- DT_mat_last[apply(DT_mat_last[, -1], MARGIN=1, function(x) any(abs(x) == 1)), ]
+
+logFC_mat[logFC_mat < -thr] <- -thr
+logFC_mat[logFC_mat > thr] <- thr
+logFC_mat_sub <- logFC_mat[rownames(DT_mat_last_DE),]
+pheatmap(logFC_mat_sub,  
+         breaks=seq(from=-thr, to=thr, length=101), 
+         cluster_cols=FALSE,
+         show_rownames=FALSE, treeheight_row=0, treeheight_col=0,
+         main=paste("Heatmap of logFC for the DE genes", tag))
+
+pheatmap(head(logFC_mat[order(abs(logFC_mat$InfectedvsControl_24), decreasing=TRUE),], topX),  
+         breaks=seq(from=-thr, to=thr, length=101), 
+         cluster_cols=FALSE,
+         show_rownames=FALSE, treeheight_row=0, treeheight_col=0,
+         main=paste("Heatmap of logFC for the top", topX, " genes", tag))
+```
+
+## Venn Diagram
+Venn Diagram of the three most interested comparisons with multiple DE. Note the numbers do not agree between both venn diagrams. The second diagram shows only those genes that were either up in both samples or down in both samples.
+The first diagram also includes genes that were up in one sample and down in the other, which is a less restrictive criterion. 
+And the total numbers in each contrast do add up the same.
+```{r, fig.width=8}
+DT_mat_interested <- DT_mat[, c("InfectedvsControl_2vs0", 
+                                "InfectedvsControl_24vs4", 
+                                "InfectedvsControl_48vs24")]
+vennDiagram(DT_mat_interested, cex = c(1, 1, 0.8), main = "Common/unique DE genes")
+```
+```{r, fig.width=8}
+vennDiagram(DT_mat_interested, cex = c(1, 1, 0.8), include = c("up", "down"), counts.col = c("red", 
+    "blue"), main = "Common/uniquly regulated genes")
+```
