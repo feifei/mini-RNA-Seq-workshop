@@ -1,6 +1,7 @@
-GTF_FILE="/data/feifei/Others/Jingyi/data/wb.gtf"
-WORK_DIR="/data/feifei/Others/Jingyi/mapping/"
-BAM_FILES="${WORK_DIR}*.sorted.bam"
+WORK_DIR=$(pwd)
+GTF_FILE="${WORK_DIR}/data/wb.gtf"
+MAP_DIR="${WORK_DIR}/mapping"
+BAM_FILES="${MAP_DIR}/*.sorted.bam"
 
 for BAM_FILE in ${BAM_FILES}
 do

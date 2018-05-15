@@ -1,4 +1,4 @@
-WORK_DIR=/data/feifei/Eimeria/mapping2/
+WORK_DIR=$(pwd)
 cd ${WORK_DIR}
 
 declare -a arr=("eimeria" "gallus")
