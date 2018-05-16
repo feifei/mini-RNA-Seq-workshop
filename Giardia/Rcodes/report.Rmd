@@ -46,14 +46,14 @@ topX <- 2000 # to display in the final heatmap
 thr <- 5 # Set max/min logFC change in the heatmap
 bwColors <- colorRampPalette(c("white", "darkblue")) #?
 
-directory <- "/Volumes/Molev/data/Others/Jingyi/"
-annotation_tab <- paste(directory, "data/wb.tab", sep="") # annotation
-directory <- paste(directory, "edgeR/", sep="")
+directory <- "../data/"
+annotation_tab <- paste(directory, "wb.tab", sep="") # annotation
 meta_file <- paste(directory, "metadata.csv", sep="")
+counts_dir <- paste(directory, "counts", sep="")
 ```
 
 ## Data summary
-TYDK is the control, NOFERRIC is TYDK without ferric (less iron), 50uM is TYDK without ferric and supplemented with 50 µM iron inhibitor (even less iron).
+TYDK is the control, NOFERRIC is TYDK without ferric (less iron), 50µM is TYDK without ferric and supplemented with 50 µM iron inhibitor (even less iron).
 ```{r}
 d <- read.csv2(meta_file)
 
@@ -71,7 +71,7 @@ datatable(d, options = list(scrollX = TRUE))
 ## Buid DGE
 Read and merge files containing gene expression counts.
 ```{r}
-y <- readDGE(d$sampleFiles, path=directory, group=d$Group, header=FALSE)
+y <- readDGE(d$sampleFiles, path=counts_dir, group=d$Group, header=FALSE)
 # colnames(y$counts) <- group
 ```
 
