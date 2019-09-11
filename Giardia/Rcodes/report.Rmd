@@ -38,24 +38,20 @@ This report provides the analysis of RNA-Seq data from iron-depletion experiment
 
 
 # Data preparation
-Giardia WB reference genome and annotation were from GiardiaDB (v. 5.0). Annotation in GFF file was converted to GTF to mapping with STAR v. 020201, htseq-count was used to extract the raw counts from the mapped .BAM files.
+The new *Giardia* WB genome was used.`STAR` v020201 was used to map the concatenated reference genomes.  `ReadsPerGene.out.tab` output from `STAR` with specifying `--quantMode GeneCounts`. 
 
 ## Specify some pararmeters, directory and files
 ```{r}
-topX <- 2000 # to display in the final heatmap
-thr <- 5 # Set max/min logFC change in the heatmap
-bwColors <- colorRampPalette(c("white", "darkblue")) #?
+directory <- "data/"
+meta_file <- "data/metadata.tab"
 
-directory <- "../data/"
-annotation_tab <- paste(directory, "wb.tab", sep="") # annotation
-meta_file <- paste(directory, "metadata.csv", sep="")
-counts_dir <- paste(directory, "counts", sep="")
+annotation_tab <- "data/wb_annotation.tab"
 ```
 
 ## Data summary
-TYDK is the control, NOFERRIC is TYDK without ferric (less iron), 50µM is TYDK without ferric and supplemented with 50 µM iron inhibitor (even less iron).
+TYDK is the control, NOFERRIC is TYDK without ferric (less iron), 50uM is TYDK without ferric and supplemented with 50 µM iron inhibitor (even less iron).
 ```{r}
-d <- read.csv2(meta_file)
+d <- read.csv(meta_file, sep = "\t")
 
 sampleFiles <- paste(d$Identifier, ".counts", sep="")
 d$sampleFiles <- sampleFiles
@@ -64,14 +60,14 @@ conditions <- c("IronInh", "NoFerric", "Control")
 group <- factor(rep(conditions, each=3))
   
 d <- cbind(d,Group=group)
-# d <- d[-7, ] # Remove TYDK-1
+d <- d[-7, ] # Remove TYDK-1
 datatable(d, options = list(scrollX = TRUE))
 ```
 
 ## Buid DGE
 Read and merge files containing gene expression counts.
 ```{r}
-y <- readDGE(d$sampleFiles, path=counts_dir, group=d$Group, header=FALSE)
+y <- readDGE(d$sampleFiles, path="counts", group=d$Group, header=FALSE)
 # colnames(y$counts) <- group
 ```
 
@@ -128,6 +124,7 @@ Below we can compare the different libraries before and after normalizations.
 Relative Log Expression (RLE) plots are powerful tool for visalizaing unwanted variation in high dimensional data. Ideally all boxplots should be centered around 0 and be of similar width. Compare the boxplots before and after normaliztion, we can see the normalization worked well for this data.
 
 ```{r, fig.width=9, fig.height=6}
+group.col <- diverge_hcl(length(levels(group)))[factor(group)]
 boxplot(sweep(logCPM_prenorm, 1, median_prenorm, "-"), col = as.character(group.col), 
         las = 2, main = "RLE plot pre-normalization")
 abline(h = 0, lty = 2)
@@ -220,7 +217,7 @@ plot_pheatmap <- function(qlf, summ, contrast, ...) {
   top.genes <- row.names(DE.top)
   top.logcpm <- logCPM[top.genes, ]
   pheatmap(top.logcpm, cluster_cols = FALSE,
-           show_rownames=FALSE, color=bwColors(100), main=paste(contrast, "log-counts-per-million", tag))
+           show_rownames=FALSE, color=diverge_hcl(100), main=paste(contrast, "log-counts-per-million", tag))
 }
 ```
 
@@ -341,6 +338,12 @@ colnames(result_summary) <- dimnames(my.contrasts)$Contrasts
 colnames(result_logFC1_summary) <- dimnames(my.contrasts)$Contrasts
 ```
 
+```{r}
+cpm <- format(logCPM, digits=2, nsmall=1)
+write.csv(cpm, file=paste(directory, "all.cpm.csv", sep=""))
+
+```
+
 ## Summary of DE genes
 Genes that are DE are the ones with adjusted p-value (same as FDR in the table) less than a defined false discovery (FDR) rate. The adjusted p-value is used as opposed to the initial p-value as it has been adjusted for multiple testing. The FDR cutoff is set at 0.05. So genes with adjusted p-value < 0.05 is considered as DE, which were further classified into up- or down- regulated. Up-regulated genes has a positve log-fold change, while down-regulated genes has a negative log-fold change. DE with abs(logFC) > 1 was also show below.
 
@@ -351,16 +354,16 @@ datatable(merged_summary)
 ```
 
 ## Heatmap of the logFC 
-Heatmap of the logFC of the DE genes as well as heatmap of the top, `r topX`, genes.
+Heatmap of the logFC of the DE genes as well as heatmap of the top 500 genes.
 ```{r}
 # subset logFC_mat to DE logFC_mat
 DT_mat_DE <- DT_mat[apply(DT_mat[, -1], MARGIN=1, function(x) any(abs(x) == 1)), ]
 
-logFC_mat[logFC_mat < -thr] <- -thr
-logFC_mat[logFC_mat > thr] <- thr
+logFC_mat[logFC_mat < -3] <- -3
+logFC_mat[logFC_mat > 3] <- 3
 logFC_mat_sub <- logFC_mat[rownames(DT_mat_DE),]
 pheatmap(logFC_mat_sub,  
-         breaks=seq(from=-thr, to=thr, length=101), 
+         breaks=seq(from=-3, to=3, length=101), 
          cluster_cols=FALSE,
          show_rownames=FALSE, treeheight_row=0, treeheight_col=0,
          main=paste("Heatmap of logFC for the DE genes", tag))
